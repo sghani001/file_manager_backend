@@ -1,0 +1,453 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: 'CloudVault File Manager - Full Stack: VPC, RDS, EC2, S3, Lambda, EventBridge'
+
+Parameters:
+  BucketName:
+    Type: String
+    Description: Globally unique S3 bucket name for file uploads (e.g. cloudvault-uploads-YOURNAME)
+  DBUsername:
+    Type: String
+    Default: postgres
+  DBPassword:
+    Type: String
+    NoEcho: true
+    Description: RDS master password (min 8 chars)
+  RailsMasterKey:
+    Type: String
+    NoEcho: true
+    Description: Rails credentials decryption key (from config/master.key)
+  JWTSecret:
+    Type: String
+    NoEcho: true
+    Description: JWT token signing secret
+  LambdaWebhookSecret:
+    Type: String
+    NoEcho: true
+    Description: Shared secret between Lambda and Rails webhook
+  InstanceType:
+    Type: String
+    Default: t3.medium
+    AllowedValues: [t3.medium, t3.large, t3.xlarge]
+  GithubBackendRepo:
+    Type: String
+    Description: URL to the Rails API backend repository
+  GithubFrontendRepo:
+    Type: String
+    Description: URL to the React frontend repository
+  GitBranch:
+    Type: String
+    Default: main
+
+Mappings:
+  RegionAZ:
+    us-east-1:
+      AZ1: us-east-1a
+      AZ2: us-east-1b
+    us-east-2:
+      AZ1: us-east-2a
+      AZ2: us-east-2b
+
+Resources:
+  # ====
+  # VPC
+  # ====
+  VPC:
+    Type: AWS::EC2::VPC
+    Properties:
+      CidrBlock: 10.0.0.0/16
+      EnableDnsSupport: true
+      EnableDnsHostnames: true
+      Tags: [{Key: Name, Value: cloudvault-vpc}]
+
+  InternetGateway:
+    Type: AWS::EC2::InternetGateway
+    Properties:
+      Tags: [{Key: Name, Value: cloudvault-igw}]
+
+  VPCGatewayAttachment:
+    Type: AWS::EC2::VPCGatewayAttachment
+    Properties:
+      VpcId: !Ref VPC
+      InternetGatewayId: !Ref InternetGateway
+
+  PublicRouteTable:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !Ref VPC
+      Tags: [{Key: Name, Value: cloudvault-public-rt}]
+
+  PublicRoute:
+    Type: AWS::EC2::Route
+    DependsOn: VPCGatewayAttachment
+    Properties:
+      RouteTableId: !Ref PublicRouteTable
+      DestinationCidrBlock: 0.0.0.0/0
+      GatewayId: !Ref InternetGateway
+
+  PublicSubnet1:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref VPC
+      CidrBlock: 10.0.1.0/24
+      AvailabilityZone: !FindInMap [RegionAZ, !Ref 'AWS::Region', AZ1]
+      MapPublicIpOnLaunch: true
+      Tags: [{Key: Name, Value: cloudvault-public-1}]
+
+  PublicSubnet2:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref VPC
+      CidrBlock: 10.0.2.0/24
+      AvailabilityZone: !FindInMap [RegionAZ, !Ref 'AWS::Region', AZ2]
+      MapPublicIpOnLaunch: true
+      Tags: [{Key: Name, Value: cloudvault-public-2}]
+
+  Subnet1Association:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      RouteTableId: !Ref PublicRouteTable
+      SubnetId: !Ref PublicSubnet1
+
+  Subnet2Association:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      RouteTableId: !Ref PublicRouteTable
+      SubnetId: !Ref PublicSubnet2
+
+  # ====
+  # Security Groups
+  # ====
+  EC2SecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: EC2 - HTTP(80) from anywhere
+      VpcId: !Ref VPC
+      SecurityGroupIngress:
+        - {IpProtocol: tcp, FromPort: 80, ToPort: 80, CidrIp: 0.0.0.0/0}
+      Tags: [{Key: Name, Value: cloudvault-ec2-sg}]
+
+  RDSSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: RDS - PostgreSQL from EC2 SG only
+      VpcId: !Ref VPC
+      SecurityGroupIngress:
+        - {IpProtocol: tcp, FromPort: 5432, ToPort: 5432, SourceSecurityGroupId: !Ref EC2SecurityGroup}
+      Tags: [{Key: Name, Value: cloudvault-rds-sg}]
+
+  # ====
+  # RDS PostgreSQL
+  # ====
+  DBSubnetGroup:
+    Type: AWS::RDS::DBSubnetGroup
+    Properties:
+      DBSubnetGroupDescription: CloudVault RDS subnets
+      SubnetIds: [!Ref PublicSubnet1, !Ref PublicSubnet2]
+
+  Database:
+    Type: AWS::RDS::DBInstance
+    Properties:
+      DBInstanceIdentifier: cloudvault-db
+      Engine: postgres
+      EngineVersion: '16'
+      DBInstanceClass: db.t3.micro
+      AllocatedStorage: 20
+      DBName: cloudvault_production
+      MasterUsername: !Ref DBUsername
+      MasterUserPassword: !Ref DBPassword
+      DBSubnetGroupName: !Ref DBSubnetGroup
+      VPCSecurityGroups: [!GetAtt RDSSecurityGroup.GroupId]
+      PubliclyAccessible: true
+      BackupRetentionPeriod: 0
+      DeletionProtection: false
+    UpdateReplacePolicy: Delete
+    DeletionPolicy: Delete
+
+  # ====
+  # EC2 Instance (SSH via SSM Session Manager)
+  # ====
+  EC2Role:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal: {Service: ec2.amazonaws.com}
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/AmazonSSMManagedInstanceCore
+      Policies:
+        - PolicyName: CloudVaultEC2
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action: [s3:GetObject, s3:PutObject, s3:HeadObject, s3:ListBucket]
+                Resource:
+                  - !Sub arn:aws:s3:::${BucketName}
+                  - !Sub arn:aws:s3:::${BucketName}/*
+              - Effect: Allow
+                Action: [lambda:InvokeFunction, lambda:UpdateFunctionConfiguration]
+                Resource: !GetAtt FileProcessor.Arn
+
+  EC2InstanceProfile:
+    Type: AWS::IAM::InstanceProfile
+    Properties:
+      Roles: [!Ref EC2Role]
+
+  EC2Instance:
+    Type: AWS::EC2::Instance
+    DependsOn: Database
+    Properties:
+      ImageId: !Sub 'resolve:ssm:/aws/service/ami-amazon-linux-latest/al2023-ami-kernel-default-x86_64'
+      InstanceType: !Ref InstanceType
+      SubnetId: !Ref PublicSubnet1
+      SecurityGroupIds: [!GetAtt EC2SecurityGroup.GroupId]
+      IamInstanceProfile: !Ref EC2InstanceProfile
+      BlockDeviceMappings:
+        - DeviceName: /dev/xvda
+          Ebs: {VolumeSize: 30, VolumeType: gp3}
+      Tags: [{Key: Name, Value: cloudvault-ec2}]
+      UserData:
+        Fn::Base64:
+          Fn::Sub:
+            - |
+              #!/bin/bash
+              set -e
+              exec > >(tee /var/log/cloudvault-deploy.log) 2>&1
+
+              echo "=== CLOUDVAULT BOOTSTRAP ==="
+
+              # System deps
+              dnf update -y
+              dnf install -y docker git
+
+              # Swap file
+              if ! swapon --show | grep -q '/swapfile'; then
+                fallocate -l 2G /swapfile && chmod 600 /swapfile
+                mkswap /swapfile && swapon /swapfile
+                echo '/swapfile none swap sw 0 0' >> /etc/fstab
+              fi
+
+              # Docker
+              systemctl enable docker && systemctl start docker
+              docker network create cloudvault-net 2>/dev/null || true
+
+              # Clone repos
+              mkdir -p /opt/cloudvault
+              cd /opt/cloudvault
+              git clone --branch ${GitBranch} ${GithubBackendRepo} backend
+              git clone --branch ${GitBranch} ${GithubFrontendRepo} frontend
+
+              # Get public IP
+              TOKEN=$(curl -s -X PUT "http://169.254.169.254/latest/api/token" -H "X-aws-ec2-metadata-token-ttl-seconds: 21600")
+              PUBLIC_IP=$(curl -s -H "X-aws-ec2-metadata-token: $TOKEN" http://169.254.169.254/latest/meta-data/public-ipv4)
+
+              # Build images
+              docker build -t cloudvault-api /opt/cloudvault/backend
+              docker build -t cloudvault-ui /opt/cloudvault/frontend
+
+              # Run backend
+              DATABASE_URL="postgres://${DBUsername}:${DBPassword}@${RDSHost}:5432/cloudvault_production"
+              docker run -d --name cloudvault-api --net cloudvault-net -p 3000:80 \
+                -e RAILS_ENV=production \
+                -e RAILS_MASTER_KEY=${RailsMasterKey} \
+                -e DATABASE_URL="$DATABASE_URL" \
+                -e AWS_REGION=${Region} \
+                -e AWS_BUCKET_NAME=${BucketName} \
+                -e JWT_SECRET=${JWTSecret} \
+                -e CORS_ORIGINS="http://$PUBLIC_IP" \
+                -e DOMAIN="$PUBLIC_IP" \
+                -e LAMBDA_WEBHOOK_SECRET=${LambdaWebhookSecret} \
+                -e LAMBDA_FUNCTION_NAME=${LambdaFunctionName} \
+                --restart unless-stopped cloudvault-api
+
+              # Wait for database and run migrations
+              echo "Waiting for database..."
+              for i in {1..30}; do
+                if docker exec cloudvault-api rails db:prepare 2>/dev/null; then
+                  echo "Database ready, migrations done"
+                  break
+                fi
+                echo "Attempt $i: DB not ready, retrying in 10s..."
+                sleep 10
+              done
+
+              # Run frontend
+              docker run -d --name cloudvault-ui --net cloudvault-net -p 80:80 \
+                -e VITE_API_URL="http://$PUBLIC_IP:3000" \
+                --restart unless-stopped cloudvault-ui
+
+              # Update Lambda webhook URL with public IP
+              aws lambda update-function-configuration \
+                --function-name ${LambdaFunctionName} \
+                --environment "Variables={WEBHOOK_URL=http://$PUBLIC_IP/api/v1/processing/webhook,WEBHOOK_SECRET=${LambdaWebhookSecret}}" \
+                --region ${Region}
+
+              echo "=== DEPLOYMENT COMPLETE ==="
+              echo "Frontend: http://$PUBLIC_IP"
+              echo "Backend:  http://$PUBLIC_IP:3000"
+            - {
+                DBUsername: !Ref DBUsername,
+                DBPassword: !Ref DBPassword,
+                RDSHost: !GetAtt Database.Endpoint.Address,
+                BucketName: !Ref BucketName,
+                JWTSecret: !Ref JWTSecret,
+                RailsMasterKey: !Ref RailsMasterKey,
+                LambdaWebhookSecret: !Ref LambdaWebhookSecret,
+                LambdaFunctionName: !Ref FileProcessor,
+                GitBranch: !Ref GitBranch,
+                GithubBackendRepo: !Ref GithubBackendRepo,
+                GithubFrontendRepo: !Ref GithubFrontendRepo,
+                Region: !Ref 'AWS::Region'
+              }
+
+  # ====
+  # S3 Bucket
+  # ====
+  UploadBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Ref BucketName
+      VersioningConfiguration: {Status: Enabled}
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+    UpdateReplacePolicy: Delete
+    DeletionPolicy: Delete
+
+  # ====
+  # Lambda Function (Python 3.11)
+  # ====
+  LambdaRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal: {Service: lambda.amazonaws.com}
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: S3ReadAccess
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action: [s3:GetObject, s3:HeadObject]
+                Resource: !Sub '${UploadBucket.Arn}/*'
+
+  FileProcessor:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: cloudvault-file-processor
+      Runtime: python3.11
+      Handler: index.lambda_handler
+      Role: !GetAtt LambdaRole.Arn
+      Timeout: 30
+      Environment:
+        Variables:
+          WEBHOOK_URL: http://placeholder-updated-by-ec2-userdata
+          WEBHOOK_SECRET: !Ref LambdaWebhookSecret
+      Code:
+        ZipFile: |
+          import json, boto3, uuid, urllib.request, logging
+          from datetime import datetime
+          import os
+          logger = logging.getLogger()
+          logger.setLevel(logging.INFO)
+          s3 = boto3.client('s3')
+          def lambda_handler(event, context):
+              logger.info(f"Event: {json.dumps(event)}")
+              try:
+                  bucket = event['Records'][0]['s3']['bucket']['name']
+                  key = event['Records'][0]['s3']['object']['key']
+                  logger.info(f"Processing s3://{bucket}/{key}")
+                  resp = s3.head_object(Bucket=bucket, Key=key)
+                  file_size = resp['ContentLength']
+                  file_size_mb = round(file_size / (1024*1024), 2)
+                  result = {
+                      'file_key': key, 'file_size_mb': file_size_mb,
+                      'file_size': file_size, 'status': 'processed',
+                      'processing_id': str(uuid.uuid4()),
+                      'processed_at': datetime.utcnow().isoformat()
+                  }
+                  logger.info(f"Result: {json.dumps(result)}")
+                  webhook_url = os.environ.get('WEBHOOK_URL')
+                  webhook_secret = os.environ.get('WEBHOOK_SECRET')
+                  if webhook_url and webhook_secret:
+                      payload = json.dumps({'s3_key': key, 'result': result}).encode()
+                      req = urllib.request.Request(
+                          webhook_url, data=payload,
+                          headers={'Content-Type': 'application/json',
+                                   'X-Lambda-Webhook-Secret': webhook_secret},
+                          method='POST')
+                      resp = urllib.request.urlopen(req, timeout=10)
+                      logger.info(f"Webhook status: {resp.status}")
+                  return {'statusCode': 200, 'body': json.dumps(result)}
+              except Exception as e:
+                  logger.error(f"Error: {str(e)}", exc_info=True)
+                  return {'statusCode': 500, 'body': json.dumps({'error': str(e)})}
+
+  # ====
+  # EventBridge Rule (S3 -> Lambda)
+  # ====
+  EventRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal: {Service: events.amazonaws.com}
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: InvokeLambda
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action: lambda:InvokeFunction
+                Resource: !GetAtt FileProcessor.Arn
+
+  S3UploadRule:
+    Type: AWS::Events::Rule
+    Properties:
+      Name: cloudvault-s3-upload-rule
+      State: ENABLED
+      EventPattern:
+        source: [aws.s3]
+        detail-type: [Object Created]
+        detail:
+          bucket:
+            name: [!Ref BucketName]
+      Targets:
+        - Arn: !GetAtt FileProcessor.Arn
+          RoleArn: !GetAtt EventRole.Arn
+
+  LambdaPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref FileProcessor
+      Action: lambda:InvokeFunction
+      Principal: events.amazonaws.com
+      SourceArn: !GetAtt S3UploadRule.Arn
+
+Outputs:
+  BucketName:
+    Value: !Ref UploadBucket
+  LambdaFunctionName:
+    Value: !Ref FileProcessor
+  EC2InstanceId:
+    Value: !Ref EC2Instance
+  RDSHostname:
+    Value: !GetAtt Database.Endpoint.Address
+  VpcId:
+    Value: !Ref VPC
+
+
