@@ -1,0 +1,17 @@
+# Read about fixtures at https://api.rubyonrails.org/classes/ActiveRecord/FixtureSet.html
+
+one:
+  user_file: one
+  token: MyString
+  expires_at: 2026-07-09 14:35:19
+  access_count: 1
+  max_accesses: 1
+  passcode_digest: MyString
+
+two:
+  user_file: two
+  token: MyString
+  expires_at: 2026-07-09 14:35:19
+  access_count: 1
+  max_accesses: 1
+  passcode_digest: MyString
