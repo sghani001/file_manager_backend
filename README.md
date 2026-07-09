@@ -58,9 +58,47 @@ bin/bundler-audit    # Dependency audit
 bin/rubocop          # Lint
 ```
 
+## Production Architecture
+
+```
+Browser ──> Nginx ──> /api/* ──> Rails (Docker)
+                │                      │
+                ├──> SPA               ├──> PostgreSQL (RDS)
+                │                      ├──> S3 presigned URLs
+                └──> S3 direct upload  └──> Lambda webhook
+```
+
+- **Compute:** Docker container on EC2 (Amazon Linux 2023)
+- **Reverse proxy:** Nginx routes `/api/*` to Rails on Docker network
+- **Database:** RDS PostgreSQL (db.t3.micro)
+- **Storage:** S3 with presigned URLs (via `aws-sdk-s3`)
+- **Processing:** Python Lambda triggered by S3 EventBridge, calls Rails webhook
+- **Background jobs:** Solid Queue via database-backed jobs
+
+## Production Environment Variables
+
+| Variable | Description |
+|---|---|
+| `RAILS_MASTER_KEY` | Credentials decryption key |
+| `DATABASE_URL` | PostgreSQL connection string |
+| `AWS_REGION` | AWS region (e.g. us-east-1) |
+| `AWS_BUCKET_NAME` | S3 bucket for uploads |
+| `AWS_ACCESS_KEY_ID` | IAM credentials (or use instance profile) |
+| `AWS_SECRET_ACCESS_KEY` | IAM credentials |
+| `JWT_SECRET` | Token signing key |
+| `CORS_ORIGINS` | Allowed frontend origins |
+| `DOMAIN` | Public domain/IP for host authorization |
+| `LAMBDA_WEBHOOK_SECRET` | Shared secret for Lambda → Rails webhook |
+| `LAMBDA_FUNCTION_NAME` | Lambda function for file reprocessing |
+
 ## Deployment
 
+Deployment files are in `infrastructure/` (not tracked in git):
+
 ```bash
-bin/kamal setup      # First-time server provision
-bin/kamal deploy     # Deploy application
+# Requires: AWS CLI, Docker, EC2 + RDS provisioned
+./infrastructure/user-data.sh   # EC2 bootstrap script
+aws cloudformation deploy ...   # S3 + Lambda + EventBridge stack
 ```
+
+See `docs/Project_2_Deployment_Complete.md` for full guide.
