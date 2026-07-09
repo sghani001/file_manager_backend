@@ -15,6 +15,9 @@ Rails.application.routes.draw do
       # Simulated S3 PUT uploads
       put 'local_s3_uploads', to: 'local_s3_uploads#create'
 
+      # Lambda webhook (no JWT auth, uses shared secret)
+      post 'processing/webhook', to: 'processing_webhook#handle'
+
       # Sharing links
       resources :share_links, only: [:create]
       get 'shares/:token', to: 'share_links#show'
