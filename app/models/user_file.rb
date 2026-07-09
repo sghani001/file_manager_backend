@@ -6,16 +6,8 @@ class UserFile < ApplicationRecord
   before_create :generate_s3_key
 
   def presigned_upload_url
-    if ENV['AWS_BUCKET_NAME'].present? && ENV['AWS_REGION'].present?
-      # Real S3 logic
-      require 'aws-sdk-s3'
-      s3 = Aws::S3::Resource.new(region: ENV['AWS_REGION'])
-      bucket = s3.bucket(ENV['AWS_BUCKET_NAME'])
-      bucket.object(s3_key).presigned_url(:put, expires_in: 3600)
-    else
-      # Mock local Rails upload URL
-      "http://localhost:3000/api/v1/local_s3_uploads?s3_key=#{CGI.escape(s3_key)}"
-    end
+    # Local upload via nginx proxy — files stored on EC2 disk under public/uploads/
+    "/api/v1/local_s3_uploads?s3_key=#{CGI.escape(s3_key)}"
   end
 
   def mark_processing
