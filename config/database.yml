@@ -90,9 +90,8 @@ test:
 production:
   primary: &primary_production
     <<: *default
+    url: <%= ENV["DATABASE_URL"] || "postgres://#{ENV.fetch('DB_USERNAME', 'backend')}:#{ENV.fetch('DB_PASSWORD', '')}@#{ENV.fetch('DB_HOST', 'localhost')}/backend_production" %>
     database: backend_production
-    username: backend
-    password: <%= ENV["BACKEND_DATABASE_PASSWORD"] %>
   cache:
     <<: *primary_production
     database: backend_production_cache

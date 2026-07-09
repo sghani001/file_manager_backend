@@ -34,3 +34,9 @@
 # Ignore uploaded files (user data, not source)
 /public/uploads/files/
 
+# Ignore local environment files
+/.env
+/.env.local
+/.env.development
+/.env.production
+

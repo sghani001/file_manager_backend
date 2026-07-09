@@ -1,13 +1,18 @@
 module Api
   module V1
     class LocalS3UploadsController < ApplicationController
-      # Skip authentication for upload simulation to match S3 direct upload behavior
-      skip_before_action :authorized
+      before_action :authorized
 
       def create
         s3_key = params[:s3_key]
         if s3_key.blank?
           return render json: { error: 's3_key parameter is required' }, status: :bad_request
+        end
+
+        # Verify the file belongs to the current user
+        file = current_user.user_files.find_by(s3_key: s3_key)
+        if file.nil?
+          return render json: { error: 'File record not found' }, status: :not_found
         end
 
         # Clean the s3_key and ensure it doesn't try to directory traverse

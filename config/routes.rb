@@ -9,13 +9,11 @@ Rails.application.routes.draw do
 
       post 'files/presigned_url', to: 'files#create_presigned_url'
       post 'files/:id/mark_uploaded', to: 'files#mark_uploaded'
+      get 'files/:id/download', to: 'files#download'
       resources :files, only: [:index]
 
       # Simulated S3 PUT uploads
       put 'local_s3_uploads', to: 'local_s3_uploads#create'
-
-      # AI Chat Assistant
-      post 'chat', to: 'chat#query'
 
       # Sharing links
       resources :share_links, only: [:create]

@@ -40,6 +40,6 @@ class ApplicationController < ActionController::API
   private
 
   def jwt_secret
-    ENV['JWT_SECRET'].presence || Rails.application.secret_key_base || 'development_jwt_secret_key_12345'
+    ENV.fetch('JWT_SECRET')
   end
 end
