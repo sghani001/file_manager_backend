@@ -43,6 +43,54 @@ module Api
         end
       end
 
+      def reprocess
+        file = current_user.user_files.find(params[:id])
+        file.update!(status: 'processing')
+        file.create_processing_job!(status: 'queued') unless file.processing_job
+        file.processing_job.update!(status: 'queued', result: nil, error_message: nil)
+
+        # Invoke Lambda with a synthetic S3 event to reprocess the file
+        Thread.new do
+          begin
+            require 'aws-sdk-lambda'
+            lambda = Aws::Lambda::Client.new(region: ENV['AWS_REGION'] || 'us-east-1')
+            lambda.invoke(
+              function_name: 'cloudvault-file-processor',
+              invocation_type: 'Event',
+              payload: JSON.generate({
+                version: '0',
+                id: SecureRandom.uuid,
+                'detail-type': 'Object Created',
+                source: 'aws.s3',
+                account: '',
+                time: Time.current.iso8601,
+                region: ENV['AWS_REGION'] || 'us-east-1',
+                resources: ["arn:aws:s3:::#{ENV['AWS_BUCKET_NAME']}"],
+                detail: {
+                  version: '0',
+                  bucket: { name: ENV['AWS_BUCKET_NAME'] },
+                  object: {
+                    key: file.s3_key,
+                    size: file.file_size,
+                    etag: '',
+                    'version-id': '',
+                    sequencer: ''
+                  },
+                  'request-id': '',
+                  requester: '',
+                  'source-ip-address': '',
+                  reason: 'PutObject'
+                }
+              })
+            )
+          rescue => e
+            Rails.logger.error("Lambda invocation failed: #{e.message}")
+          end
+        end
+
+        render json: { status: 'processing' }
+      end
+
       private
     end
   end

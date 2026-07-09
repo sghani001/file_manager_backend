@@ -38,6 +38,8 @@ gem "rack-cors"
 
 # AWS SDK for S3 presigned URLs
 gem "aws-sdk-s3", "~> 1.0"
+# AWS SDK for Lambda invocation (reprocessing)
+gem "aws-sdk-lambda", "~> 1.0"
 
 group :development, :test do
   # See https://guides.rubyonrails.org/debugging_rails_applications.html#debugging-with-the-debug-gem
