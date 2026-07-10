@@ -35,12 +35,13 @@ module Api
 
       def download
         file = current_user.user_files.find(params[:id])
-        local_path = Rails.root.join('public', 'uploads', file.s3_key)
-        if ::File.exist?(local_path)
-          send_file local_path, type: file.file_type, filename: file.name
-        else
-          render json: { error: 'File not found on disk' }, status: :not_found
-        end
+        signer = Aws::S3::Presigner.new
+        url = signer.presigned_url(:get_object,
+          bucket: ENV['AWS_BUCKET_NAME'],
+          key: file.s3_key,
+          expires_in: 3600
+        )
+        redirect_to url, allow_other_host: true
       end
 
       def reprocess
