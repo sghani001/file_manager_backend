@@ -24,6 +24,9 @@ Parameters:
     Type: String
     NoEcho: true
     Description: Shared secret between Lambda and Rails webhook
+  KeyName:
+    Type: AWS::EC2::KeyPair::KeyName
+    Description: EC2 SSH key pair name
   InstanceType:
     Type: String
     Default: t3.medium
@@ -127,6 +130,7 @@ Resources:
       VpcId: !Ref VPC
       SecurityGroupIngress:
         - {IpProtocol: tcp, FromPort: 80, ToPort: 80, CidrIp: 0.0.0.0/0}
+        - {IpProtocol: tcp, FromPort: 22, ToPort: 22, CidrIp: 0.0.0.0/0}
       Tags: [{Key: Name, Value: cloudvault-ec2-sg}]
 
   RDSSecurityGroup:
@@ -205,6 +209,7 @@ Resources:
     Properties:
       ImageId: !Ref LatestAmi
       InstanceType: !Ref InstanceType
+      KeyName: !Ref KeyName
       SubnetId: !Ref PublicSubnet1
       SecurityGroupIds: [!GetAtt EC2SecurityGroup.GroupId]
       IamInstanceProfile: !Ref EC2InstanceProfile
@@ -269,7 +274,7 @@ Resources:
               # Wait for database and run migrations
               echo "Waiting for database..."
               for i in {1..30}; do
-                if docker exec cloudvault-api rails db:prepare 2>/dev/null; then
+                if docker exec -w /rails cloudvault-api bin/rails db:prepare 2>/dev/null; then
                   echo "Database ready, migrations done"
                   break
                 fi
@@ -279,8 +284,40 @@ Resources:
 
               # Run frontend
               docker run -d --name cloudvault-ui --net cloudvault-net -p 80:80 \
-                -e VITE_API_URL="http://$PUBLIC_IP:3000" \
                 --restart unless-stopped cloudvault-ui
+
+              # Configure nginx reverse proxy for /api/ -> backend
+              docker exec cloudvault-ui sh -c "cat > /etc/nginx/conf.d/default.conf << 'EOF'
+server {
+  listen 80;
+  root /usr/share/nginx/html;
+  index index.html;
+
+  location /api/ {
+    proxy_pass http://cloudvault-api:80;
+    proxy_set_header Host \$host;
+    proxy_set_header X-Real-IP \$remote_addr;
+    proxy_set_header X-Forwarded-For \$proxy_add_x_forwarded_for;
+    proxy_set_header X-Forwarded-Proto \$scheme;
+  }
+
+  location / {
+    try_files \$uri /index.html;
+  }
+}
+EOF"
+              docker exec cloudvault-ui nginx -s reload
+
+              # Set S3 CORS for direct uploads
+              aws s3api put-bucket-cors --bucket ${BucketName} --cors-configuration '{
+                "CORSRules": [{
+                  "AllowedHeaders": ["*"],
+                  "AllowedMethods": ["GET","PUT","POST","HEAD"],
+                  "AllowedOrigins": ["*"],
+                  "ExposeHeaders": ["ETag"],
+                  "MaxAgeSeconds": 3600
+                }]
+              }' --region ${Region} || true
 
               # Update Lambda webhook URL with public IP
               aws lambda update-function-configuration \
@@ -319,6 +356,13 @@ Resources:
         BlockPublicPolicy: true
         IgnorePublicAcls: true
         RestrictPublicBuckets: true
+      CorsConfiguration:
+        CorsRules:
+          - AllowedHeaders: ['*']
+            AllowedMethods: [GET, PUT, POST, HEAD]
+            AllowedOrigins: ['*']
+            ExposeHeaders: [ETag]
+            MaxAgeSeconds: 3600
     UpdateReplacePolicy: Delete
     DeletionPolicy: Delete
 
@@ -358,40 +402,86 @@ Resources:
           WEBHOOK_URL: http://placeholder-updated-by-ec2-userdata
           WEBHOOK_SECRET: !Ref LambdaWebhookSecret
       Code:
-        ZipFile: |
+          ZipFile: |
           import json, boto3, uuid, urllib.request, logging
           from datetime import datetime
           import os
           logger = logging.getLogger()
           logger.setLevel(logging.INFO)
           s3 = boto3.client('s3')
+          def handle_status(context):
+              return {
+                  'statusCode': 200,
+                  'headers': {'Content-Type': 'application/json'},
+                  'body': json.dumps({
+                      'service': 'CloudVault File Processor',
+                      'status': 'running',
+                      'timestamp': datetime.utcnow().isoformat(),
+                      'function_name': context.function_name,
+                      'function_version': context.function_version,
+                      'log_group': context.log_group_name,
+                      'log_stream': context.log_stream_name,
+                      'instructions': 'POST a synthetic EventBridge event to test processing, or upload a file via the UI to trigger automatically'
+                  })
+              }
+          def handle_test(event, context):
+              body = event.get('body', '{}')
+              if isinstance(body, str):
+                  body = json.loads(body)
+              synthetic_event = body.get('event', {
+                  'version': '0',
+                  'detail-type': 'Object Created',
+                  'source': 'aws.s3',
+                  'detail': {
+                      'bucket': {'name': os.environ.get('BUCKET_NAME', 'test-bucket')},
+                      'object': {'key': body.get('key', 'test/sample.txt'), 'size': 100}
+                  }
+              })
+              result = process_event(synthetic_event)
+              return {
+                  'statusCode': 200,
+                  'headers': {'Content-Type': 'application/json'},
+                  'body': json.dumps({'test_result': result})
+              }
+          def process_event(event):
+              if 'Records' in event:
+                  bucket = event['Records'][0]['s3']['bucket']['name']
+                  key = event['Records'][0]['s3']['object']['key']
+              else:
+                  bucket = event['detail']['bucket']['name']
+                  key = event['detail']['object']['key']
+              logger.info(f"Processing s3://{bucket}/{key}")
+              resp = s3.head_object(Bucket=bucket, Key=key)
+              file_size = resp['ContentLength']
+              file_size_mb = round(file_size / (1024*1024), 2)
+              result = {
+                  'file_key': key, 'file_size_mb': file_size_mb,
+                  'file_size': file_size, 'status': 'processed',
+                  'processing_id': str(uuid.uuid4()),
+                  'processed_at': datetime.utcnow().isoformat()
+              }
+              logger.info(f"Result: {json.dumps(result)}")
+              webhook_url = os.environ.get('WEBHOOK_URL')
+              webhook_secret = os.environ.get('WEBHOOK_SECRET')
+              if webhook_url and webhook_secret:
+                  payload = json.dumps({'s3_key': key, 'result': result}).encode()
+                  req = urllib.request.Request(
+                      webhook_url, data=payload,
+                      headers={'Content-Type': 'application/json',
+                               'X-Lambda-Webhook-Secret': webhook_secret},
+                      method='POST')
+                  web_resp = urllib.request.urlopen(req, timeout=10)
+                  logger.info(f"Webhook status: {web_resp.status}")
+              return result
           def lambda_handler(event, context):
               logger.info(f"Event: {json.dumps(event)}")
               try:
-                  bucket = event['Records'][0]['s3']['bucket']['name']
-                  key = event['Records'][0]['s3']['object']['key']
-                  logger.info(f"Processing s3://{bucket}/{key}")
-                  resp = s3.head_object(Bucket=bucket, Key=key)
-                  file_size = resp['ContentLength']
-                  file_size_mb = round(file_size / (1024*1024), 2)
-                  result = {
-                      'file_key': key, 'file_size_mb': file_size_mb,
-                      'file_size': file_size, 'status': 'processed',
-                      'processing_id': str(uuid.uuid4()),
-                      'processed_at': datetime.utcnow().isoformat()
-                  }
-                  logger.info(f"Result: {json.dumps(result)}")
-                  webhook_url = os.environ.get('WEBHOOK_URL')
-                  webhook_secret = os.environ.get('WEBHOOK_SECRET')
-                  if webhook_url and webhook_secret:
-                      payload = json.dumps({'s3_key': key, 'result': result}).encode()
-                      req = urllib.request.Request(
-                          webhook_url, data=payload,
-                          headers={'Content-Type': 'application/json',
-                                   'X-Lambda-Webhook-Secret': webhook_secret},
-                          method='POST')
-                      resp = urllib.request.urlopen(req, timeout=10)
-                      logger.info(f"Webhook status: {resp.status}")
+                  if 'requestContext' in event and 'httpMethod' in event:
+                      if event['httpMethod'] == 'GET':
+                          return handle_status(context)
+                      elif event['httpMethod'] == 'POST':
+                          return handle_test(event, context)
+                  result = process_event(event)
                   return {'statusCode': 200, 'body': json.dumps(result)}
               except Exception as e:
                   logger.error(f"Error: {str(e)}", exc_info=True)
@@ -430,7 +520,8 @@ Resources:
           bucket:
             name: [!Ref BucketName]
       Targets:
-        - Arn: !GetAtt FileProcessor.Arn
+        - Id: FileProcessorTarget
+          Arn: !GetAtt FileProcessor.Arn
           RoleArn: !GetAtt EventRole.Arn
 
   LambdaPermission:
@@ -440,6 +531,16 @@ Resources:
       Action: lambda:InvokeFunction
       Principal: events.amazonaws.com
       SourceArn: !GetAtt S3UploadRule.Arn
+
+  FunctionUrl:
+    Type: AWS::Lambda::Url
+    Properties:
+      TargetFunctionArn: !Ref FileProcessor
+      AuthType: AWS_IAM
+      Cors:
+        AllowOrigins: ['*']
+        AllowMethods: [GET, POST]
+        AllowHeaders: ['Content-Type']
 
 Outputs:
   BucketName:
@@ -452,5 +553,8 @@ Outputs:
     Value: !GetAtt Database.Endpoint.Address
   VpcId:
     Value: !Ref VPC
+  LambdaUrl:
+    Description: Lambda Function URL for demo
+    Value: !GetAtt FunctionUrl.FunctionUrl
 
 
