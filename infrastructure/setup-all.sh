@@ -1,9 +1,8 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# ── Colors ──────────────────────────────────────────────────────────────────
 RED='\033[0;31m'; GREEN='\033[0;32m'; CYAN='\033[0;36m'; YELLOW='\033[1;33m'
-NC='\033[0m' # No Color
+NC='\033[0m'
 
 echo -e "${CYAN}========================================${NC}"
 echo -e "${CYAN}  CloudVault File Manager — Provisioner${NC}"
@@ -13,15 +12,19 @@ echo ""
 # ── Prerequisites ───────────────────────────────────────────────────────────
 echo -e "${CYAN}>>> Checking prerequisites...${NC}"
 command -v aws >/dev/null 2>&1 || { echo "ERROR: AWS CLI not found"; exit 1; }
+aws sts get-caller-identity --output json >/dev/null 2>&1 || { echo "ERROR: AWS CLI not authenticated"; exit 1; }
 
-aws sts get-caller-identity --output json >/dev/null 2>&1 || { echo "ERROR: AWS CLI not authenticated. Run 'aws configure' first."; exit 1; }
-
-TEMPLATE="$(cd "$(dirname "$0")" && pwd)/cloudvault-full-stack.yaml"
+if pwd -W >/dev/null 2>&1; then
+    TEMPLATE_DIR="$(cd "$(dirname "$0")" && pwd -W)"
+else
+    TEMPLATE_DIR="$(cd "$(dirname "$0")" && pwd)"
+fi
+TEMPLATE="$TEMPLATE_DIR/cloudvault-full-stack.yaml"
 if [ ! -f "$TEMPLATE" ]; then
     echo "ERROR: Template not found at $TEMPLATE"
     exit 1
 fi
-echo -e "  ${GREEN}OK${NC} Prerequisites met"
+echo -e "  ${GREEN}OK${NC}"
 echo ""
 
 # ── Read inputs ─────────────────────────────────────────────────────────────
@@ -34,7 +37,7 @@ prompt_required() {
         else
             read -p "  $label: " val
         fi
-        [ -z "$val" ] && echo -e "  ${YELLOW}(this value is required)${NC}"
+        [ -z "$val" ] && echo -e "  ${YELLOW}(required)${NC}"
     done
     echo "$val"
 }
@@ -62,57 +65,72 @@ LAMBDA_WEBHOOK_SECRET=$(prompt_required "Lambda webhook secret" "true")
 INSTANCE_TYPE=$(prompt_optional "EC2 instance type" "t3.medium")
 
 echo ""
-echo -e "${CYAN}>>> Configuration summary:${NC}"
+echo -e "${CYAN}>>> Summary:${NC}"
 echo "  Region:              $REGION"
-echo "  Stack name:          $STACK_NAME"
+echo "  Stack:               $STACK_NAME"
 echo "  S3 bucket:           $BUCKET_NAME"
 echo "  Backend repo:        $GITHUB_BACKEND"
 echo "  Frontend repo:       $GITHUB_FRONTEND"
-echo "  Git branch:          $GIT_BRANCH"
+echo "  Branch:              $GIT_BRANCH"
 echo "  DB username:         $DB_USERNAME"
 echo "  DB password:         ********"
-echo "  EC2 instance type:   $INSTANCE_TYPE"
+echo "  EC2 type:            $INSTANCE_TYPE"
 echo ""
 
-read -p "Proceed with deployment? [y/N] " CONFIRM
+read -p "Proceed? [y/N] " CONFIRM
 if [ "$CONFIRM" != "y" ] && [ "$CONFIRM" != "Y" ]; then
     echo -e "${YELLOW}Aborted.${NC}"; exit 0
 fi
 
-# ── Deploy CloudFormation ───────────────────────────────────────────────────
-echo -e "${CYAN}>>> Deploying stack '$STACK_NAME' to $REGION (10-15 minutes)...${NC}"
+# ── Write parameters to temp file ──────────────────────────────────────────
+PARAM_FILE=$(mktemp)
+cat > "$PARAM_FILE" <<EOF
+[
+    {"ParameterKey":"BucketName","ParameterValue":"$BUCKET_NAME"},
+    {"ParameterKey":"DBUsername","ParameterValue":"$DB_USERNAME"},
+    {"ParameterKey":"DBPassword","ParameterValue":"$DB_PASSWORD"},
+    {"ParameterKey":"RailsMasterKey","ParameterValue":"$RAILS_MASTER_KEY"},
+    {"ParameterKey":"JWTSecret","ParameterValue":"$JWT_SECRET"},
+    {"ParameterKey":"LambdaWebhookSecret","ParameterValue":"$LAMBDA_WEBHOOK_SECRET"},
+    {"ParameterKey":"InstanceType","ParameterValue":"$INSTANCE_TYPE"},
+    {"ParameterKey":"GithubBackendRepo","ParameterValue":"$GITHUB_BACKEND"},
+    {"ParameterKey":"GithubFrontendRepo","ParameterValue":"$GITHUB_FRONTEND"},
+    {"ParameterKey":"GitBranch","ParameterValue":"$GIT_BRANCH"}
+]
+EOF
 
-aws cloudformation deploy \
-    --template-file "$TEMPLATE" \
+# Build file:// URI (convert Windows backslashes to forward slashes)
+TEMPLATE_URI="file:///$(echo "$TEMPLATE" | sed 's|\\|/|g')"
+
+# ── Create stack ───────────────────────────────────────────────────────────
+echo -e "${CYAN}>>> Creating stack '$STACK_NAME' in $REGION (15-20 min)...${NC}"
+aws cloudformation create-stack \
     --stack-name "$STACK_NAME" \
-    --parameter-overrides \
-        BucketName="$BUCKET_NAME" \
-        DBUsername="$DB_USERNAME" \
-        DBPassword="$DB_PASSWORD" \
-        RailsMasterKey="$RAILS_MASTER_KEY" \
-        JWTSecret="$JWT_SECRET" \
-        LambdaWebhookSecret="$LAMBDA_WEBHOOK_SECRET" \
-        InstanceType="$INSTANCE_TYPE" \
-        GithubBackendRepo="$GITHUB_BACKEND" \
-        GithubFrontendRepo="$GITHUB_FRONTEND" \
-        GitBranch="$GIT_BRANCH" \
+    --template-body "$TEMPLATE_URI" \
+    --parameters "file://$PARAM_FILE" \
     --capabilities CAPABILITY_IAM \
     --region "$REGION"
 
 if [ $? -ne 0 ]; then
-    echo "ERROR: Stack deployment failed"
+    rm -f "$PARAM_FILE"
+    echo "ERROR: Stack creation failed"
     exit 1
 fi
-echo -e "  ${GREEN}OK${NC} Stack creation initiated"
+echo -e "  ${GREEN}OK${NC} Creation initiated"
 
 # ── Wait for stack ──────────────────────────────────────────────────────────
-echo -e "${CYAN}>>> Waiting for stack creation to complete...${NC}"
+echo -e "${CYAN}>>> Waiting for stack creation...${NC}"
 aws cloudformation wait stack-create-complete --stack-name "$STACK_NAME" --region "$REGION"
 if [ $? -ne 0 ]; then
-    aws cloudformation describe-stacks --stack-name "$STACK_NAME" --region "$REGION" --query 'Stacks[0].StackStatus'
-    echo "ERROR: Stack did not reach CREATE_COMPLETE"
+    STATUS=$(aws cloudformation describe-stacks --stack-name "$STACK_NAME" --region "$REGION" \
+        --query 'Stacks[0].StackStatus' --output text)
+    echo "ERROR: Stack status: $STATUS"
+    aws cloudformation describe-stack-events --stack-name "$STACK_NAME" --region "$REGION" \
+        --query 'StackEvents[0].ResourceStatusReason' --output text
+    rm -f "$PARAM_FILE"
     exit 1
 fi
+rm -f "$PARAM_FILE"
 echo -e "  ${GREEN}OK${NC} Stack creation complete"
 
 # ── Get outputs ─────────────────────────────────────────────────────────────
@@ -134,12 +152,12 @@ echo -e "  ${GREEN}RDS endpoint:    $RDS_HOST${NC}"
 echo -e "${CYAN}>>> Enabling S3 EventBridge notifications...${NC}"
 aws s3api put-bucket-notification-configuration --bucket "$BUCKET_NAME_OUT" \
     --notification-configuration '{"EventBridgeConfiguration": {}}' --region "$REGION"
-echo -e "  ${GREEN}OK${NC} EventBridge enabled"
+echo -e "  ${GREEN}OK${NC}"
 
 # ── Wait for EC2 ────────────────────────────────────────────────────────────
-echo -e "${CYAN}>>> Waiting for EC2 instance to boot (Docker build + migrations = 5-10 min)...${NC}"
+echo -e "${CYAN}>>> Waiting for EC2 to boot (Docker + migrations = 5-10 min)...${NC}"
 aws ec2 wait instance-status-ok --instance-ids "$EC2_ID" --region "$REGION"
-echo -e "  ${GREEN}OK${NC} EC2 is running"
+echo -e "  ${GREEN}OK${NC} EC2 running"
 
 PUBLIC_IP=$(aws ec2 describe-instances --instance-ids "$EC2_ID" --region "$REGION" \
     --query 'Reservations[0].Instances[0].PublicIpAddress' --output text)
@@ -156,12 +174,7 @@ echo -e "  RDS endpoint:  $RDS_HOST"
 echo -e "  S3 bucket:     $BUCKET_NAME_OUT"
 echo -e "  Lambda:        $LAMBDA_NAME"
 echo ""
-echo -e "  ${YELLOW}SSM connect:${NC}"
-echo -e "    aws ssm start-session --target $EC2_ID --region $REGION"
-echo ""
-echo -e "  ${YELLOW}Tail deploy log:${NC}"
-echo -e "    tail -f /var/log/cloudvault-deploy.log"
-echo ""
-echo -e "  ${YELLOW}Note: Lambda WEBHOOK_URL is auto-configured by user-data.${NC}"
-echo -e "  ${YELLOW}Check 'docker ps' on EC2 to confirm both containers run.${NC}"
+echo -e "  ${YELLOW}SSM: aws ssm start-session --target $EC2_ID --region $REGION${NC}"
+echo -e "  ${YELLOW}Log: tail -f /var/log/cloudvault-deploy.log${NC}"
+echo -e "  ${YELLOW}Lambda WEBHOOK_URL is auto-configured by EC2 user-data${NC}"
 echo -e "${GREEN}========================================${NC}"
