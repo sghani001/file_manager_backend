@@ -37,7 +37,7 @@ gem "thruster", require: false
 gem "rack-cors"
 
 # AWS SDK for S3 presigned URLs
-gem "aws-sdk-s3", "~> 1.0"
+gem "aws-sdk-s3", "~> 1.228"
 # AWS SDK for Lambda invocation (reprocessing)
 gem "aws-sdk-lambda", "~> 1.0"
 
